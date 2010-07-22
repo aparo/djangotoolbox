@@ -217,6 +217,10 @@ class NonrelCompiler(SQLCompiler):
         for field in fields:
             if not field.null and entity.get(field.column,
                     field.get_default()) is None:
+                typename = type(field).__name__
+                if typename == "DictField":
+                    result.append({})
+                    continue
                 raise DatabaseError("Non-nullable field %s can't be None!" % field.name)
             result.append(self.convert_value_from_db(field.db_type(
                 connection=self.connection), entity.get(field.column, field.get_default())))
