@@ -1,244 +1,135 @@
+# All fields except for BlobField written by Jonas Haag <jonas@lophus.org>
+
 from django.db import models
-from django.db.models import Field, CharField
-from django.utils.translation import ugettext_lazy as _
+from django.core.exceptions import ValidationError
 
-#class ListField(models.Field):
-#    def __init__(self, field_type, *args, **kwargs):
-#        self.field_type = field_type
-#        kwargs['blank'] = True
-#        if 'default' not in kwargs:
-#            kwargs['default'] = lambda: None if self.null else []
-#        super(ListField, self).__init__(*args, **kwargs)
-#
-#    def db_type(self, connection):
-#        if hasattr(self.field_type, "db_type"):
-#            return 'ListField:' + self.field_type.db_type(connection=connection)
-#        return 'ListField: %s' % self.field_type
-#
-#    def call_for_each(self, function_name, values, *args, **kwargs):
-#        #forcing type cast
-#        if isinstance(values, (list, tuple)) and len(values):
-#            for i, value in enumerate(values):
-#                try:
-#                    values[i] = getattr(self.field_type, function_name)(value, *args, **kwargs)
-#                except AttributeError:
-#                    #fix to allow str, unicode, datetime elements
-#                    pass
-#        return values
-#
-#    def to_python(self, value):
-#        return self.call_for_each( 'to_python', value)
-#
-#    def get_prep_value(self, value):
-#        return self.call_for_each('get_prep_value', value)
-#
-#    def get_db_prep_value(self, value, connection, prepared=False):
-#        return self.call_for_each('get_db_prep_value', value, connection=connection,
-#            prepared=prepared)
-#
-#    def get_db_prep_save(self, value, connection):
-#        return self.call_for_each('get_db_prep_save', value, connection=connection)
-#
-#    def formfield(self, **kwargs):
-#        return None
+__all__ = ('GenericField', 'ListField', 'DictField', 'SetField', 'BlobField')
 
-class ListField(Field):
-    """A list field that wraps a standard field, allowing multiple instances
-    of the field to be used as a list in the database.
+class RawField(models.Field):
+    """ Generic field to store anything your database backend allows you to. """
+    def get_internal_type(self):
+        return 'RawField'
+
+class AbstractIterableField(models.Field):
     """
+    Abstract field for fields for storing iterable data type like ``list``,
+    ``set`` and ``dict``.
 
-    default_error_messages = {
-        'invalid': _(u'This value must be a list or an iterable.'),
-        'invalid_value': _(u'Invalid value in list.'),
-    }
+    You can pass an instance of a field as the first argument.
+    If you do, the iterable items will be piped through the passed field's
+    validation and conversion routines, converting the items to the
+    appropriate data type.
+    """
+    def __init__(self, item_field=None, *args, **kwargs):
+        if item_field is None:
+            item_field = RawField()
+        self.item_field = item_field
+        default = kwargs.get('default', None if kwargs.get('null') else ())
+        if default is not None and not callable(default):
+            # ensure a new object is created every time the default is accessed
+            kwargs['default'] = lambda: self._type(default)
+        super(AbstractIterableField, self).__init__(*args, **kwargs)
 
-    description = _("List Field")
-    _internaltype = None
-    def __init__(self, type, *args, **kwargs):
-        self._internaltype = type
-        kwargs['blank'] = True
-        if 'default' not in kwargs:
-            kwargs['default'] = []
-            
-        Field.__init__(self, *args, **kwargs)
+    def contribute_to_class(self, cls, name):
+        self.item_field.model = cls
+        self.item_field.name = name
+        super(AbstractIterableField, self).contribute_to_class(cls, name)
 
-    def validate(self, value, model_instance):
-        """
-        Validates value and throws ValidationError. 
-        """
-        if not isinstance(value, list) and (not hasattr(value, "__iter__")):
-            raise exceptions.ValidationError(self.error_messages['invalid'])
+    def db_type(self, connection):
+        item_db_type = self.item_field.db_type(connection=connection)
+        return '%s:%s' % (self.__class__.__name__, item_db_type)
 
-        if value is None and not self.null:
-            raise exceptions.ValidationError(self.error_messages['null'])
-
-        if not self.blank and value in validators.EMPTY_VALUES:
-            raise exceptions.ValidationError(self.error_messages['blank'])
-        if self._internaltype is not None:
-            for v in value:
-                if not isinstance(v, self._internaltype):
-                    raise exceptions.ValidationError(self.error_messages['invalid_value'])
-        
-    def get_prep_value(self, value):
-        if value is None:
-            return None
-        return list(value)
+    def _convert(self, func, values, *args, **kwargs):
+        if isinstance(values, (list, tuple, set)):
+            return self._type(func(value, *args, **kwargs) for value in values)
+        return values
 
     def to_python(self, value):
-        if value is None:
-            return []
-        return value
-
-    def get_default(self):
-        "Returns the default value for this field."
-        if self.has_default():
-            if callable(self.default):
-                return self.default()
-            return self.default
-        return []
-
-class SortedListField(ListField):
-    """A ListField that sorts the contents of its list before writing to
-    the database in order to ensure that a sorted list is always
-    retrieved.
-    """
-
-    description = _("Sorted Field")
-    _ordering = None
-
-    def __init__(self, *args, **kwargs):
-        if 'ordering' in kwargs.keys():
-            self._ordering = kwargs.pop('ordering')
-        self._internaltype = type
-        super(SortedListField, self).__init__(*args, **kwargs)
-
-    def get_prep_value(self, value):
-        if value is None:
-            return None
-        if not isinstance(value, list) and (not hasattr(value, "__iter__")):
-            raise exceptions.ValidationError(self.error_messages['invalid'])
-        if self._ordering is not None:
-            return sorted(value, key=itemgetter(self._ordering))
-        return sorted(value)
-    
-class DictField(Field):
-    """A dictionary field that wraps a standard Python dictionary.
-    Key cannot contains . or $ for query problems.
-    """
-    description = _("Dict Field")
-
-    default_error_messages = {
-        'invalid': _(u'This value must be a dictionary.'),
-        'invalid_key': _(u'Invalid dictionary key name - Keys cannot contains . or $ for query problems'),
-    }
-
-    def validate(self, value, model_instance):
-        """
-        Validates value and throws ValidationError. 
-        """
-        if not isinstance(value, dict):
-            raise exceptions.ValidationError(self.error_messages['invalid'])
-
-
-        if value is None and not self.null:
-            raise exceptions.ValidationError(self.error_messages['null'])
-
-        if not self.blank and value in validators.EMPTY_VALUES:
-            raise exceptions.ValidationError(self.error_messages['blank'])
-
-    def get_default(self):
-        "Returns the default value for this field."
-        if self.has_default():
-            if callable(self.default):
-                return self.default()
-            return self.default
-        return {}
-
-class SetListField(Field):
-    """A list field that allows only one instance for item.
-    """
-
-    description = _("List Set Field")
-    _internaltype = None
-    default_error_messages = {
-        'invalid': _(u'This value must be a set.'),
-        'invalid_value': _(u'Invalid value in list.'),
-    }
-
-    def __init__(self, *args, **kwargs):
-        kwargs['blank'] = True
-        if 'default' not in kwargs:
-            kwargs['default'] = set()
-        if 'type' in kwargs:
-            self._internaltype = kwargs.pop("type")
-
-        Field.__init__(self, *args, **kwargs)
-    def validate(self, value, model_instance):
-        """
-        Validates value and throws ValidationError. 
-        """
-        if not isinstance(value, set):
-            raise exceptions.ValidationError(self.error_messages['invalid'])
-
-        if value is None and not self.null:
-            raise exceptions.ValidationError(self.error_messages['null'])
-
-        if not self.blank and value in validators.EMPTY_VALUES:
-            raise exceptions.ValidationError(self.error_messages['blank'])
-        if self._internaltype is not None:
-            for v in value:
-                if not isinstance(v, self._internaltype):
-                    raise exceptions.ValidationError(self.error_messages['invalid_value'])
-
-    def get_default(self):
-        "Returns the default value for this field."
-        if self.has_default():
-            if callable(self.default):
-                return self.default()
-            return self.default
-        return set()
-
+        return self._convert(self.item_field.to_python, value)
 
     def get_db_prep_value(self, value, connection, prepared=False):
-        """Returns field's value prepared for interacting with the database
-        backend.
+        return self._convert(self.item_field.get_db_prep_value, value,
+                             connection=connection, prepared=prepared)
 
-        Used by the default implementations of ``get_db_prep_save``and
-        `get_db_prep_lookup```
-        """
-        if not prepared:
-            value = list(self.get_prep_value(value))
-        return value
-    
-    def get_prep_value(self, value):
-        if value is None:
+    def get_db_prep_save(self, value, connection):
+        return self._convert(self.item_field.get_db_prep_save,
+                             value, connection=connection)
+
+    def validate(self, values, model_instance):
+        try:
+            iter(values)
+        except TypeError:
+            raise ValidationError('Value of type %r is not iterable' % type(values))
+
+    def formfield(self, **kwargs):
+        raise NotImplementedError('No form field implemented for %r' % type(self))
+
+class ListField(AbstractIterableField):
+    """
+    Field representing a Python ``list``.
+
+    If the optional keyword argument `ordering` is given, it must be a callable
+    that is passed to :meth:`list.sort` as `key` argument. If `ordering` is
+    given, the items in the list will be sorted before sending them to the
+    database.
+    """
+    _type = list
+
+    def __init__(self, *args, **kwargs):
+        self.ordering = kwargs.pop('ordering', None)
+        if self.ordering is not None and not callable(self.ordering):
+            raise TypeError("'ordering' has to be a callable or None, "
+                            "not of type %r" %  type(self.ordering))
+        super(ListField, self).__init__(*args, **kwargs)
+
+    def _convert(self, func, values, *args, **kwargs):
+        values = super(ListField, self)._convert(func, values, *args, **kwargs)
+        if values is not None and self.ordering is not None:
+            values.sort(key=self.ordering)
+        return values
+
+class SetField(AbstractIterableField):
+    """
+    Field representing a Python ``set``.
+    """
+    _type = set
+
+class DictField(AbstractIterableField):
+    """
+    Field representing a Python ``dict``.
+
+    The field type conversions described in :class:`AbstractIterableField`
+    only affect values of the dictionary, not keys.
+
+    Depending on the backend, keys that aren't strings might not be allowed.
+    """
+    _type = dict
+
+    def _convert(self, func, values, *args, **kwargs):
+        if values is None:
             return None
-        if not isinstance(value, set):
-            if hasattr(value, "__iter__"):
-                value = set(value)
-        return set(value)
-    
-    def to_python(self, value):
-        """
-        Converts the input value into the expected Python data type, raising
-        django.core.exceptions.ValidationError if the data can't be converted.
-        Returns the converted value.
-        """
-        if value is None:
-            return set()
-        return set(value)
+        return dict((key, func(value, *args, **kwargs))
+                     for key, value in values.iteritems())
 
+    def validate(self, values, model_instance):
+        if not isinstance(values, dict):
+            raise ValidationError('Value is of type %r. Should be a dict.' % type(values))
 
-    
 class BlobField(models.Field):
     """
-    A field for storing blobs of binary data
+    A field for storing blobs of binary data.
+
+    The value might either be a string (or something that can be converted to
+    a string), or a file-like object.
+
+    In the latter case, the object has to provide a ``read`` method from which
+    the blob is read.
     """
     def get_internal_type(self):
         return 'BlobField'
 
     def formfield(self, **kwargs):
-        # A file widget is provided, but use  model FileField or ImageField 
+        # A file widget is provided, but use model FileField or ImageField
         # for storing specific files most of the time
         from .widgets import BlobWidget
         from django.forms import FileField
@@ -246,11 +137,10 @@ class BlobField(models.Field):
         defaults.update(kwargs)
         return super(BlobField, self).formfield(**defaults)
 
-    def get_db_prep_value(self, value, connection, prepared=False):        
-        try:
-            # Sees if the object passed in is file-like
+    def get_db_prep_value(self, value, connection, prepared=False):
+        if hasattr(value, 'read'):
             return value.read()
-        except:
+        else:
             return str(value)
 
     def get_db_prep_lookup(self, lookup_type, value, connection, prepared=False):

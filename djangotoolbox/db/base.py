@@ -13,6 +13,7 @@ class NonrelDatabaseFeatures(BaseDatabaseFeatures):
     distinguishes_insert_from_update = False
     supports_deleting_related_objects = False
     string_based_auto_field = False
+    supports_dicts = False
 
 class NonrelDatabaseOperations(BaseDatabaseOperations):
     def __init__(self, connection):
@@ -35,6 +36,9 @@ class NonrelDatabaseOperations(BaseDatabaseOperations):
         return value
 
     def prep_for_like_query(self, value):
+        return value
+
+    def prep_for_iexact_query(self, value):
         return value
 
     def check_aggregate_support(self, aggregate):

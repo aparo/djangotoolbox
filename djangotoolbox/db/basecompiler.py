@@ -2,7 +2,7 @@ from django.conf import settings
 from django.db.models.sql import aggregates as sqlaggregates
 from django.db.models.sql.compiler import SQLCompiler
 from django.db.models.sql.constants import LOOKUP_SEP, MULTI, SINGLE
-from django.db.models.sql.where import AND, OR
+from django.db.models.sql.where import AND, OR, Constraint
 from django.db.utils import DatabaseError, IntegrityError
 from django.utils.tree import Node
 import random
@@ -85,6 +85,9 @@ class NonrelQuery(object):
         constraint, lookup_type, annotation, value = child
         packed, value = constraint.process(lookup_type, value, self.connection)
         alias, column, db_type = packed
+        if alias and alias != self.query.model._meta.db_table:
+            raise DatabaseError("This database doesn't support JOINs "
+                                "and multi-table inheritance.")
         value = self._normalize_lookup_value(value, annotation, lookup_type)
         return column, lookup_type, db_type, value
 
@@ -121,11 +124,10 @@ class NonrelQuery(object):
         # not necessary with emulated negation handling code
         result = []
         for child in children:
-            if isinstance(child, Node) and child.negated and \
-                    len(child.children) == 1 and \
-                    isinstance(child.children[0], tuple):
-                node, lookup_type, annotation, value = child.children[0]
-                if lookup_type == 'isnull' and value == True and node.field is None:
+            if isinstance(child, tuple):
+                constraint = child[0]
+                lookup_type = child[1]
+                if lookup_type == 'isnull' and constraint.field is None:
                     continue
             result.append(child)
         return result
@@ -144,6 +146,9 @@ class NonrelQuery(object):
                 constraint, lookup_type, annotation, value = child
                 packed, value = constraint.process(lookup_type, value, self.connection)
                 alias, column, db_type = packed
+                if alias != self.query.model._meta.db_table:
+                    raise DatabaseError("This database doesn't support JOINs "
+                                        "and multi-table inheritance.")
 
                 # Django fields always return a list (see Field.get_db_prep_lookup)
                 # except if get_db_prep_lookup got overridden by a subclass
@@ -206,28 +211,12 @@ class NonrelCompiler(SQLCompiler):
         """
         Returns an iterator over the results from executing this query.
         """
+        self.check_query()
         fields = self.get_fields()
         low_mark = self.query.low_mark
         high_mark = self.query.high_mark
         for entity in self.build_query(fields).fetch(low_mark, high_mark):
             yield self._make_result(entity, fields)
-
-    def _make_result(self, entity, fields):
-        result = []
-        for field in fields:
-            if not field.null and entity.get(field.column,
-                    field.get_default()) is None:
-                typename = type(field).__name__
-                if typename == "DictField":
-                    result.append({})
-                    continue
-                if typename == "ListField":
-                    result.append([])
-                    continue
-                raise DatabaseError("Non-nullable field %s can't be None!" % field.name)
-            result.append(self.convert_value_from_db(field.db_type(
-                connection=self.connection), entity.get(field.column, field.get_default())))
-        return result
 
     def has_results(self):
         return self.get_count(check_exists=True)
@@ -254,6 +243,21 @@ class NonrelCompiler(SQLCompiler):
     # ----------------------------------------------
     # Additional NonrelCompiler API
     # ----------------------------------------------
+    def _make_result(self, entity, fields):
+        result = []
+        for field in fields:
+            if not field.null and entity.get(field.column,
+                    field.get_default()) is None:
+                raise DatabaseError("Non-nullable field %s can't be None!" % field.name)
+            result.append(self.convert_value_from_db(field.db_type(
+                connection=self.connection), entity.get(field.column, field.get_default())))
+        return result
+
+    def check_query(self):
+        if (len([a for a in self.query.alias_map if self.query.alias_refcount[a]]) > 1
+                or self.query.distinct or self.query.extra or self.query.having):
+            raise DatabaseError('This query is not supported by the database.')
+
     def get_count(self, check_exists=False):
         """
         Counts matches using the current filter constraints.
@@ -278,7 +282,7 @@ class NonrelCompiler(SQLCompiler):
 
     def get_fields(self):
         """
-        Returns the fields which should get loaded from the backend by self.query        
+        Returns the fields which should get loaded from the backend by self.query
         """
         # We only set this up here because
         # related_select_fields isn't populated until
@@ -294,6 +298,15 @@ class NonrelCompiler(SQLCompiler):
             db_table = self.query.model._meta.db_table
             fields = [f for f in fields if db_table in only_load and
                       f.column in only_load[db_table]]
+
+        query_model = self.query.model
+        if query_model._meta.proxy:
+            query_model = query_model._meta.proxy_for_model
+
+        for field in fields:
+            if field.model._meta != query_model._meta:
+                raise DatabaseError('Multi-table inheritance is not supported '
+                                    'by non-relational DBs.')
         return fields
 
     def _get_ordering(self):

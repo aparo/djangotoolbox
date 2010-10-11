@@ -1,8 +1,9 @@
-from .fields import ListField
-from django.db import models
+from .fields import ListField, SetField, DictField
+from .test import skip_if
+from django.db import models, connections
 from django.db.models import Q
-#from django.db.utils import DatabaseError
 from django.test import TestCase
+from django.db.utils import DatabaseError
 
 class ListModel(models.Model):
     floating_point = models.FloatField()
@@ -10,9 +11,24 @@ class ListModel(models.Model):
     names_with_default = ListField(models.CharField(max_length=500), default=[])
     names_nullable = ListField(models.CharField(max_length=500), null=True)
 
+class OrderedListModel(models.Model):
+    ordered_ints = ListField(models.IntegerField(max_length=500), default=[],
+                             ordering=lambda x: x, null=True)
+    ordered_nullable = ListField(ordering=lambda x:x, null=True)
+
+class SetModel(models.Model):
+    setfield = SetField(models.IntegerField())
+
+supports_dicts = getattr(connections['default'].features, 'supports_dicts', False)
+if supports_dicts:
+    class DictModel(models.Model):
+        dictfield = DictField(models.IntegerField())
+        dictfield_nullable = DictField(null=True)
+
 class FilterTest(TestCase):
     floats = [5.3, 2.6, 9.1, 1.58]
     names = [u'Kakashi', u'Naruto', u'Sasuke', u'Sakura',]
+    unordered_ints = [4, 2, 6, 1]
 
     def setUp(self):
         for i, float in enumerate(FilterTest.floats):
@@ -25,14 +41,23 @@ class FilterTest(TestCase):
                             ['Kakashi', 'Naruto', 'Sasuke', 'Sakura',]])
 
     def test_options(self):
-        self.assertEquals([entity.names_with_default for entity in
+        self.assertEqual([entity.names_with_default for entity in
                            ListModel.objects.filter(names__startswith='Sa')],
                           [[], []])
 
-        # TODO: should it be NULL or None here?
-        self.assertEquals([entity.names_nullable for entity in
+        self.assertEqual([entity.names_nullable for entity in
                            ListModel.objects.filter(names__startswith='Sa')],
                           [None, None])
+
+    def test_default_value(self):
+        # Make sure default value is copied
+        ListModel().names_with_default.append(2)
+        self.assertEqual(ListModel().names_with_default, [])
+
+    def test_ordering(self):
+        OrderedListModel(ordered_ints=self.unordered_ints).save()
+        self.assertEqual(OrderedListModel.objects.get().ordered_ints,
+                         sorted(self.unordered_ints))
 
     def test_gt(self):
         # test gt on list
@@ -105,8 +130,49 @@ class FilterTest(TestCase):
                             names__startswith='Sa')], [['Kakashi', 'Naruto',
                             'Sasuke',],])
 
-# passes on production but not on sdk
-#    def test_Q_objects(self):
-#        self.assertEquals([entity.names for entity in
-#            ListModel.objects.exclude(Q(names__lt='Sakura') | Q(names__gte='Sasuke'))],
-#                [['Kakashi', 'Naruto', 'Sasuke', 'Sakura'], ])
+    def test_setfield(self):
+        setdata = [1, 2, 3, 2, 1]
+        # At the same time test value conversion
+        SetModel(setfield=map(str, setdata)).save()
+        item = SetModel.objects.filter(setfield=3)[0]
+        self.assertEqual(item.setfield, set(setdata))
+        # This shouldn't raise an error because the default value is
+        # an empty list
+        SetModel().save()
+
+    @skip_if(not supports_dicts)
+    def test_dictfield(self):
+        DictModel(dictfield=dict(a=1, b='55', foo=3.14)).save()
+        item = DictModel.objects.get()
+        self.assertEqual(item.dictfield, {u'a' : 1, u'b' : 55, u'foo' : 3})
+        # This shouldn't raise an error becaues the default value is
+        # an empty dict
+        DictModel().save()
+
+    # passes on GAE production but not on sdk
+    @skip_if(True)
+    def test_Q_objects(self):
+        self.assertEquals([entity.names for entity in
+            ListModel.objects.exclude(Q(names__lt='Sakura') | Q(names__gte='Sasuke'))],
+                [['Kakashi', 'Naruto', 'Sasuke', 'Sakura'], ])
+
+class BaseModel(models.Model):
+    pass
+
+class ExtendedModel(BaseModel):
+    name = models.CharField(max_length=20)
+
+class BaseModelProxy(BaseModel):
+    class Meta:
+        proxy = True
+
+class ExtendedModelProxy(ExtendedModel):
+    class Meta:
+        proxy = True
+
+class ProxyTest(TestCase):
+    def test_proxy(self):
+        list(BaseModelProxy.objects.all())
+
+    def test_proxy_with_inheritance(self):
+        self.assertRaises(DatabaseError, lambda: list(ExtendedModelProxy.objects.all()))
