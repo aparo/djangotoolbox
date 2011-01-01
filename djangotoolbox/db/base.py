@@ -6,14 +6,21 @@ from django.db.backends import BaseDatabaseFeatures, BaseDatabaseOperations, \
 from .creation import NonrelDatabaseCreation
 
 class NonrelDatabaseFeatures(BaseDatabaseFeatures):
-    def __init__(self, connection):
-        self.connection = connection
-        super(NonrelDatabaseFeatures, self).__init__()
+    can_return_id_from_insert = True
+    supports_unspecified_pk = False
+    supports_regex_backreferencing = True
+    supports_date_lookup_using_string = False
+    supports_timezones = False
 
+    supports_joins = False
     distinguishes_insert_from_update = False
+    supports_select_related = False
     supports_deleting_related_objects = False
     string_based_auto_field = False
     supports_dicts = False
+
+    def _supports_transactions(self):
+        return False
 
 class NonrelDatabaseOperations(BaseDatabaseOperations):
     def __init__(self, connection):
@@ -42,11 +49,12 @@ class NonrelDatabaseOperations(BaseDatabaseOperations):
         return value
 
     def check_aggregate_support(self, aggregate):
-        # TODO: Only COUNT(*) should be supported, by default.
-        # Raise NotImplementedError in all other cases.
-        pass
+        from django.db.models.sql.aggregates import Count
+        if not isinstance(aggregate, Count):
+            raise NotImplementedError("This database does not support %r "
+                                      "aggregates" % type(aggregate))
 
-    def year_lookup_bounds(self, value): 
+    def year_lookup_bounds(self, value):
         return [datetime.datetime(value, 1, 1, 0, 0, 0, 0),
                 datetime.datetime(value+1, 1, 1, 0, 0, 0, 0)]
 

@@ -1,9 +1,18 @@
-from .fields import ListField, SetField, DictField
-from .test import skip_if
+from .fields import ListField, SetField, DictField, EmbeddedModelField
 from django.db import models, connections
 from django.db.models import Q
-from django.test import TestCase
+from django.db.models.signals import post_save
 from django.db.utils import DatabaseError
+from django.dispatch.dispatcher import receiver
+from django.test import TestCase
+from django.utils import unittest
+
+class Target(models.Model):
+    index = models.IntegerField()
+
+class Source(models.Model):
+    target = models.ForeignKey(Target)
+    index = models.IntegerField()
 
 class ListModel(models.Model):
     floating_point = models.FloatField()
@@ -24,6 +33,18 @@ if supports_dicts:
     class DictModel(models.Model):
         dictfield = DictField(models.IntegerField())
         dictfield_nullable = DictField(null=True)
+        auto_now = DictField(models.DateTimeField(auto_now=True))
+
+    class EmbeddedModelFieldModel(models.Model):
+        simple = EmbeddedModelField('EmbeddedModel', null=True)
+        typed_list = ListField(EmbeddedModelField('SetModel'))
+        untyped_list = ListField(EmbeddedModelField())
+        untyped_dict = DictField(EmbeddedModelField())
+
+    class EmbeddedModel(models.Model):
+        someint = models.IntegerField()
+        auto_now = models.DateTimeField(auto_now=True)
+        auto_now_add = models.DateTimeField(auto_now_add=True)
 
 class FilterTest(TestCase):
     floats = [5.3, 2.6, 9.1, 1.58]
@@ -140,21 +161,26 @@ class FilterTest(TestCase):
         # an empty list
         SetModel().save()
 
-    @skip_if(not supports_dicts)
+    @unittest.skipIf(not supports_dicts, "Backend doesn't support dicts")
     def test_dictfield(self):
-        DictModel(dictfield=dict(a=1, b='55', foo=3.14)).save()
+        DictModel(dictfield=dict(a=1, b='55', foo=3.14),
+                  auto_now={'a' : None}).save()
         item = DictModel.objects.get()
         self.assertEqual(item.dictfield, {u'a' : 1, u'b' : 55, u'foo' : 3})
+
+        dt = item.auto_now['a']
+        self.assertNotEqual(dt, None)
+        item.save()
+        self.assertGreater(DictModel.objects.get().auto_now['a'], dt)
         # This shouldn't raise an error becaues the default value is
         # an empty dict
         DictModel().save()
 
-    # passes on GAE production but not on sdk
-    @skip_if(True)
+    @unittest.skip('Fails with GAE SDK, but passes on production')
     def test_Q_objects(self):
         self.assertEquals([entity.names for entity in
             ListModel.objects.exclude(Q(names__lt='Sakura') | Q(names__gte='Sasuke'))],
-                [['Kakashi', 'Naruto', 'Sasuke', 'Sakura'], ])
+                [['Kakashi', 'Naruto', 'Sasuke', 'Sakura']])
 
 class BaseModel(models.Model):
     pass
@@ -176,3 +202,90 @@ class ProxyTest(TestCase):
 
     def test_proxy_with_inheritance(self):
         self.assertRaises(DatabaseError, lambda: list(ExtendedModelProxy.objects.all()))
+
+class EmbeddedModelFieldTest(TestCase):
+    def _simple_instance(self):
+        EmbeddedModelFieldModel.objects.create(simple=EmbeddedModel(someint='5'))
+        return EmbeddedModelFieldModel.objects.get()
+
+    def test_simple(self):
+        instance = self._simple_instance()
+        self.assertIsInstance(instance.simple, EmbeddedModel)
+        # Make sure get_prep_value is called:
+        self.assertEqual(instance.simple.someint, 5)
+        # AutoFields' values should not be populated:
+        self.assertEqual(instance.simple.id, None)
+
+    def test_pre_save(self):
+        # Make sure field.pre_save is called
+        instance = self._simple_instance()
+        self.assertNotEqual(instance.simple.auto_now, None)
+        self.assertNotEqual(instance.simple.auto_now_add, None)
+        auto_now = instance.simple.auto_now
+        auto_now_add = instance.simple.auto_now_add
+        instance.save()
+        instance = EmbeddedModelFieldModel.objects.get()
+        # auto_now_add shouldn't have changed now, but auto_now should.
+        self.assertEqual(instance.simple.auto_now_add, auto_now_add)
+        self.assertGreater(instance.simple.auto_now, auto_now)
+
+    def test_typed_listfield(self):
+        EmbeddedModelFieldModel.objects.create(
+            typed_list=[SetModel(setfield=range(3)), SetModel(setfield=range(9))]
+        )
+        self.assertIn(5, EmbeddedModelFieldModel.objects.get().typed_list[1].setfield)
+
+    def test_untyped_listfield(self):
+        EmbeddedModelFieldModel.objects.create(untyped_list=[
+            EmbeddedModel(someint=7),
+            OrderedListModel(ordered_ints=range(5, 0, -1)),
+            SetModel(setfield=[1, 2, 2, 3])
+        ])
+        instances = EmbeddedModelFieldModel.objects.get().untyped_list
+        for instance, cls in zip(instances, [EmbeddedModel, OrderedListModel, SetModel]):
+            self.assertIsInstance(instance, cls)
+        self.assertNotEqual(instances[0].auto_now, None)
+        self.assertEqual(instances[1].ordered_ints, range(1, 6))
+
+    def test_untyped_dict(self):
+        EmbeddedModelFieldModel.objects.create(untyped_dict={
+            'a' : SetModel(setfield=range(3)),
+            'b' : DictModel(dictfield={'a' : 1, 'b' : 2}),
+            'c' : DictModel(dictfield={}, auto_now={'y' : 1})
+        })
+        data = EmbeddedModelFieldModel.objects.get().untyped_dict
+        self.assertIsInstance(data['a'], SetModel)
+        self.assertNotEqual(data['c'].auto_now['y'], None)
+EmbeddedModelFieldTest = unittest.skipIf(
+    not supports_dicts, "Backend doesn't support dicts")(
+    EmbeddedModelFieldTest)
+
+class SignalTest(TestCase):
+    def test_post_save(self):
+        created = []
+        @receiver(post_save, sender=SetModel)
+        def handle(**kwargs):
+            created.append(kwargs['created'])
+        SetModel().save()
+        self.assertEqual(created, [True])
+        SetModel.objects.get().save()
+        self.assertEqual(created, [True, False])
+        qs = SetModel.objects.all()
+        list(qs)[0].save()
+        self.assertEqual(created, [True, False, False])
+        list(qs)[0].save()
+        self.assertEqual(created, [True, False, False, False])
+        list(qs.select_related())[0].save()
+        self.assertEqual(created, [True, False, False, False, False])
+
+class SelectRelatedTest(TestCase):
+    def test_select_related(self):
+        target = Target(index=5)
+        target.save()
+        Source(target=target, index=8).save()
+        source = Source.objects.all().select_related()[0]
+        self.assertEqual(source.target.pk, target.pk)
+        self.assertEqual(source.target.index, target.index)
+        source = Source.objects.all().select_related('target')[0]
+        self.assertEqual(source.target.pk, target.pk)
+        self.assertEqual(source.target.index, target.index)
